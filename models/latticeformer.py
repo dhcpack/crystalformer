@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
+from torch_scatter import scatter
 from .indexed_latticeformer_encoder import IndexedLatticeformerEncoder, CrystalformerEncoderCUDA
 from . import pooling
 from .latticeformer_params import LatticeformerParams
@@ -34,7 +35,7 @@ class Latticeformer(torch.nn.Module):
     Latticeformer: str
     
     """
-    def __init__(self, params):
+    def __init__(self, params, return_pos=False):
         super().__init__()
         embedding_dim = copy.deepcopy(params.embedding_dim)
         self.params = params
@@ -207,6 +208,15 @@ class Latticeformer(torch.nn.Module):
             layers.append(nn.ReLU(True))
         layers.append(nn.Linear(out_dim[-1], final_dim))
         self.mlp = nn.Sequential(*layers)
+
+
+        self.return_pos = return_pos
+        if self.return_pos:
+            self.pos_mlp = nn.Sequential(
+                nn.Linear(model_dim, model_dim),
+                nn.ReLU(),
+                nn.Linear(model_dim, 1),
+            )
         
     def forward(self, data):
         x = data.x
@@ -288,16 +298,30 @@ class Latticeformer(torch.nn.Module):
             if x0 is not None:
                 print(f"parallel mismatch: {abs(x0-x).detach().max().item()}")
         else:
+            # encoder: trans: lattice matrix, sizes: data.ptr
             x = self.encoder(x, pos, batch, trans, sizes)
         # x: (total_point_num, d_model)
 
         x = self.proj_before_pooling(x)
+
+
+        if self.return_pos:
+            from models.indexed_latticeformer_encoder import get_edge_index
+            edge_index = get_edge_index(sizes, device=sizes.device)
+            row, col = edge_index
+            msg = (pos[row] - pos[col]) * self.pos_mlp(x[col])
+            msg = scatter(msg, dim=-1, reduce='mean')
+            pos = pos + msg
+
         if self.pooling.startswith("pma"):
             x = self.pooling_layer(x, batch, sizes.shape[0])
         else:
             x = self.pooling_layer(x, batch, sizes)
 
         output_cry = self.mlp(x)
+
+        if self.return_pos:
+            return output_cry, pos
         
         return output_cry
 
